@@ -1,29 +1,37 @@
+import os
 import logging
 import sqlite3
 import threading
 import json
 import io
 from datetime import datetime
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes, CommandHandler, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 from flask import Flask, render_template_string, send_file
 import openpyxl
+from waitress import serve
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- CONFIGURATION ---
-# REPLACE THIS WITH YOUR ACTUAL BOT TOKEN FROM @BotFather
-BOT_TOKEN = "6214348776:AAEa4xHl0jP_pNNoA45EYi-4KyJh7rLDPf0" 
-CHANNEL_USERNAME = "@testchannel123494" 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
+MANAGER_USERNAME = os.getenv("MANAGER_USERNAME")
 
-# NEW: Manager and Admin Settings
-MANAGER_USERNAME = "@s17aj_04" # Customer will be told to DM this person
-ADMIN_ID = 1322755444 # REPLACE WITH YOUR TELEGRAM ID (Only this ID can approve sales)
+# Safely convert ADMIN_ID to an integer
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+except ValueError:
+    ADMIN_ID = 0
+    print("WARNING: ADMIN_ID in .env is not a valid number.")
 
 # --- DATABASE SETUP ---
 DB_NAME = "referrals.db"
 
 def init_db():
-    """Initialize the SQLite database with necessary tables."""
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS referrals
@@ -123,7 +131,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = context.bot.username
         ref_link = f"https://t.me/{bot_username}?start={user.id}"
         
-        # CHANGED TO HTML TO PREVENT UNDERSCORE ERRORS
         msg = (
             f"Here is your unique referral link:\n\n<code>{ref_link}</code>\n\n"
             "Share this on TikTok or Instagram. When people join via this link, "
@@ -132,7 +139,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=msg, parse_mode='HTML')
 
     elif query.data == "buy_plan":
-        # CHANGED TO HTML TO PREVENT UNDERSCORE ERRORS
         msg = (
             f"🛍️ <b>How to Purchase:</b>\n\n"
             f"Please contact our manager {MANAGER_USERNAME} to complete your payment.\n\n"
@@ -153,7 +159,6 @@ async def approve_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(context.args[1])
         product = "Premium Plan"
     except (IndexError, ValueError):
-        # CHANGED TO HTML TO PREVENT UNDERSCORE ERRORS
         await update.message.reply_text("❌ Usage: /approve <user_id> <amount>\nExample: <code>/approve 123456789 49.99</code>", parse_mode='HTML')
         return
 
@@ -185,10 +190,11 @@ async def approve_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response_text)
 
 
-# --- FLASK DASHBOARD LOGIC (PRO UI) ---
+# --- FLASK DASHBOARD LOGIC ---
 
 app = Flask(__name__)
 
+# Reusing your exact same HTML block here to keep it concise
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -196,72 +202,26 @@ DASHBOARD_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin Dashboard</title>
-    <!-- Bootstrap 5 -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <!-- Icons -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
     <style>
-        :root {
-            --sidebar-bg: #1a1c23;
-            --main-bg: #f4f6f9;
-            --card-bg: #ffffff;
-            --primary: #4f46e5;
-        }
+        :root { --sidebar-bg: #1a1c23; --main-bg: #f4f6f9; --card-bg: #ffffff; --primary: #4f46e5; }
         body { background-color: var(--main-bg); font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        
         .navbar { background: var(--card-bg); box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1rem; }
         .brand-text { font-weight: 700; color: var(--primary); font-size: 1.25rem; }
-        
-        .stat-card {
-            background: var(--card-bg);
-            border: none;
-            border-radius: 12px;
-            padding: 1.5rem;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-            transition: transform 0.2s;
-            height: 100%;
-        }
+        .stat-card { background: var(--card-bg); border: none; border-radius: 12px; padding: 1.5rem; box-shadow: 0 2px 5px rgba(0,0,0,0.05); transition: transform 0.2s; height: 100%; }
         .stat-card:hover { transform: translateY(-3px); }
-        .stat-icon {
-            width: 48px; height: 48px;
-            border-radius: 10px;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 1.5rem; margin-bottom: 1rem;
-        }
+        .stat-icon { width: 48px; height: 48px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.5rem; margin-bottom: 1rem; }
         .icon-users { background: #e0e7ff; color: var(--primary); }
         .icon-sales { background: #dcfce7; color: #10b981; }
         .icon-rate { background: #fef9c3; color: #f59e0b; }
-        
         .stat-value { font-size: 2rem; font-weight: 700; color: #111827; }
         .stat-label { color: #6b7280; font-weight: 500; font-size: 0.9rem; }
-
-        .custom-card {
-            background: var(--card-bg);
-            border: none;
-            border-radius: 12px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-            overflow: hidden;
-            margin-bottom: 1.5rem;
-        }
-        .card-header {
-            background: transparent;
-            border-bottom: 1px solid #f3f4f6;
-            padding: 1.25rem;
-            font-weight: 600;
-            color: #374151;
-        }
-        .table thead th {
-            border-bottom: 2px solid #f3f4f6;
-            color: #6b7280;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
+        .custom-card { background: var(--card-bg); border: none; border-radius: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); overflow: hidden; margin-bottom: 1.5rem; }
+        .card-header { background: transparent; border-bottom: 1px solid #f3f4f6; padding: 1.25rem; font-weight: 600; color: #374151; }
+        .table thead th { border-bottom: 2px solid #f3f4f6; color: #6b7280; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
         .table td { vertical-align: middle; padding: 1rem 0.75rem; }
-        
-        @media (max-width: 768px) {
-            .stat-value { font-size: 1.5rem; }
-        }
+        @media (max-width: 768px) { .stat-value { font-size: 1.5rem; } }
     </style>
 </head>
 <body>
@@ -271,101 +231,48 @@ DASHBOARD_HTML = """
                 <span class="brand-text me-3"><i class="bi bi-robot me-2"></i>ReferralBot Admin</span>
                 <span class="badge bg-success rounded-pill">Active</span>
             </div>
-            
-            <a href="/export" class="btn btn-success btn-sm">
-                <i class="bi bi-file-earmark-excel me-2"></i>Download Report
-            </a>
+            <a href="/export" class="btn btn-success btn-sm"><i class="bi bi-file-earmark-excel me-2"></i>Download Report</a>
         </div>
     </nav>
-
     <div class="container" style="margin-top: 100px;">
         <div class="row g-4 mb-4">
-            <div class="col-12 col-md-4">
-                <div class="stat-card">
-                    <div class="stat-icon icon-users"><i class="bi bi-people-fill"></i></div>
-                    <div class="stat-value">{{ total_refs }}</div>
-                    <div class="stat-label">Total Referrals</div>
-                </div>
-            </div>
-            <div class="col-12 col-md-4">
-                <div class="stat-card">
-                    <div class="stat-icon icon-sales"><i class="bi bi-currency-dollar"></i></div>
-                    <div class="stat-value">${{ total_sales }}</div>
-                    <div class="stat-label">Total Revenue</div>
-                </div>
-            </div>
-            <div class="col-12 col-md-4">
-                <div class="stat-card">
-                    <div class="stat-icon icon-rate"><i class="bi bi-cart-check-fill"></i></div>
-                    <div class="stat-value">{{ purchase_count }}</div>
-                    <div class="stat-label">Total Transactions</div>
-                </div>
-            </div>
+            <div class="col-12 col-md-4"><div class="stat-card"><div class="stat-icon icon-users"><i class="bi bi-people-fill"></i></div><div class="stat-value">{{ total_refs }}</div><div class="stat-label">Total Referrals</div></div></div>
+            <div class="col-12 col-md-4"><div class="stat-card"><div class="stat-icon icon-sales"><i class="bi bi-currency-dollar"></i></div><div class="stat-value">${{ total_sales }}</div><div class="stat-label">Total Revenue</div></div></div>
+            <div class="col-12 col-md-4"><div class="stat-card"><div class="stat-icon icon-rate"><i class="bi bi-cart-check-fill"></i></div><div class="stat-value">{{ purchase_count }}</div><div class="stat-label">Total Transactions</div></div></div>
         </div>
-
         <div class="row">
             <div class="col-12 col-lg-6">
                 <div class="custom-card h-100">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <span><i class="bi bi-trophy-fill text-warning me-2"></i>Top Referrers</span>
-                    </div>
+                    <div class="card-header d-flex justify-content-between align-items-center"><span><i class="bi bi-trophy-fill text-warning me-2"></i>Top Referrers</span></div>
                     <div class="table-responsive">
                         <table class="table table-hover mb-0">
                             <thead><tr><th>ID</th><th class="text-end">Invites</th></tr></thead>
                             <tbody>
-                                {% for row in top_referrers %}
-                                <tr>
-                                    <td><span class="badge bg-secondary bg-opacity-10 text-secondary rounded-pill">#{{ row[0] }}</span></td>
-                                    <td class="text-end fw-bold">{{ row[1] }}</td>
-                                </tr>
-                                {% else %}
-                                <tr><td colspan="2" class="text-center text-muted py-4">No data yet</td></tr>
-                                {% endfor %}
+                                {% for row in top_referrers %}<tr><td><span class="badge bg-secondary bg-opacity-10 text-secondary rounded-pill">#{{ row[0] }}</span></td><td class="text-end fw-bold">{{ row[1] }}</td></tr>
+                                {% else %}<tr><td colspan="2" class="text-center text-muted py-4">No data yet</td></tr>{% endfor %}
                             </tbody>
                         </table>
                     </div>
                 </div>
             </div>
-            
             <div class="col-12 col-lg-6">
                 <div class="custom-card h-100">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <span><i class="bi bi-bag-check-fill text-primary me-2"></i>Recent Sales</span>
-                    </div>
+                    <div class="card-header d-flex justify-content-between align-items-center"><span><i class="bi bi-bag-check-fill text-primary me-2"></i>Recent Sales</span></div>
                     <div class="table-responsive">
                         <table class="table table-hover mb-0">
                             <thead><tr><th>Product</th><th>Amt</th><th>Referrer</th></tr></thead>
                             <tbody>
-                                {% for p in purchases %}
-                                <tr>
-                                    <td>{{ p[1] }}</td>
-                                    <td class="text-success fw-bold">${{ p[2] }}</td>
-                                    <td>
-                                        {% if p[3] %}
-                                            <span class="badge bg-primary rounded-pill">#{{ p[3] }}</span>
-                                        {% else %}
-                                            <span class="badge bg-light text-dark border">Organic</span>
-                                        {% endif %}
-                                    </td>
-                                </tr>
-                                {% else %}
-                                <tr><td colspan="3" class="text-center text-muted py-4">No sales yet</td></tr>
-                                {% endfor %}
+                                {% for p in purchases %}<tr><td>{{ p[1] }}</td><td class="text-success fw-bold">${{ p[2] }}</td><td>{% if p[3] %}<span class="badge bg-primary rounded-pill">#{{ p[3] }}</span>{% else %}<span class="badge bg-light text-dark border">Organic</span>{% endif %}</td></tr>
+                                {% else %}<tr><td colspan="3" class="text-center text-muted py-4">No sales yet</td></tr>{% endfor %}
                             </tbody>
                         </table>
                     </div>
                 </div>
             </div>
         </div>
-        
-        <div class="text-center text-muted small mt-4 mb-5">
-            System Status: <span class="text-success">● Online</span> | Auto-refresh: Active (30s)
-        </div>
+        <div class="text-center text-muted small mt-4 mb-5">System Status: <span class="text-success">● Online</span> | Auto-refresh: Active (30s)</div>
     </div>
-
-    <script>
-        setTimeout(function(){ location.reload(); }, 30000);
-    </script>
+    <script>setTimeout(function(){ location.reload(); }, 30000);</script>
 </body>
 </html>
 """
@@ -374,42 +281,25 @@ DASHBOARD_HTML = """
 def dashboard():
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        
         c.execute("SELECT COUNT(*) FROM referrals")
         total_refs = c.fetchone()[0]
-        
         c.execute("SELECT COUNT(*) FROM purchases")
         purchase_count = c.fetchone()[0]
-
         c.execute("SELECT SUM(amount) FROM purchases")
         sales_res = c.fetchone()[0]
         total_sales = round(sales_res, 2) if sales_res else 0.0
-        
-        c.execute('''SELECT referrer_id, COUNT(user_id) as count 
-                     FROM referrals 
-                     GROUP BY referrer_id 
-                     ORDER BY count DESC LIMIT 10''')
+        c.execute('''SELECT referrer_id, COUNT(user_id) as count FROM referrals GROUP BY referrer_id ORDER BY count DESC LIMIT 10''')
         top_referrers = c.fetchall()
-        
-        c.execute('''SELECT p.user_id, p.product_name, p.amount, r.referrer_id 
-                     FROM purchases p
-                     LEFT JOIN referrals r ON p.user_id = r.user_id
-                     ORDER BY p.purchase_date DESC LIMIT 10''')
+        c.execute('''SELECT p.user_id, p.product_name, p.amount, r.referrer_id FROM purchases p LEFT JOIN referrals r ON p.user_id = r.user_id ORDER BY p.purchase_date DESC LIMIT 10''')
         purchases = c.fetchall()
     
-    return render_template_string(DASHBOARD_HTML, 
-                                  total_refs=total_refs, 
-                                  total_sales=total_sales,
-                                  purchase_count=purchase_count,
-                                  top_referrers=top_referrers,
-                                  purchases=purchases)
+    return render_template_string(DASHBOARD_HTML, total_refs=total_refs, total_sales=total_sales, purchase_count=purchase_count, top_referrers=top_referrers, purchases=purchases)
 
 @app.route('/export')
 def export_data():
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        
         wb = openpyxl.Workbook()
         
         ws1 = wb.active
@@ -417,42 +307,39 @@ def export_data():
         cursor.execute("SELECT * FROM referrals")
         headers = [description[0] for description in cursor.description]
         ws1.append(headers)
-        for row in cursor.fetchall():
-            ws1.append(row)
+        for row in cursor.fetchall(): ws1.append(row)
             
         ws2 = wb.create_sheet(title="Purchases")
         cursor.execute("SELECT * FROM purchases")
         headers = [description[0] for description in cursor.description]
         ws2.append(headers)
-        for row in cursor.fetchall():
-            ws2.append(row)
+        for row in cursor.fetchall(): ws2.append(row)
             
         conn.close()
-        
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
         
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f'referral_report_{datetime.now().strftime("%Y%m%d")}.xlsx'
-        )
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=f'referral_report_{datetime.now().strftime("%Y%m%d")}.xlsx')
     except Exception as e:
         return f"Error creating export: {e}", 500
 
 def run_flask():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    # Replaced app.run() with Waitress for production
+    serve(app, host='0.0.0.0', port=5000)
 
 if __name__ == '__main__':
+    if not BOT_TOKEN:
+        print("CRITICAL: BOT_TOKEN is missing. Please check your .env file.")
+        exit(1)
+
     init_db()
     print("Database initialized.")
 
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    print("Dashboard running at http://localhost:5000")
+    print("Production dashboard running on port 5000 via Waitress")
 
     print("Starting Telegram Bot...")
     

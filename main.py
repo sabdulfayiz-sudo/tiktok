@@ -6,15 +6,18 @@ import io
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes, CommandHandler, CallbackQueryHandler
-from telegram.request import HTTPXRequest  # Import request handler for timeouts
+from telegram.request import HTTPXRequest
 from flask import Flask, render_template_string, send_file
-import openpyxl # Used for Excel export without Pandas
+import openpyxl
 
 # --- CONFIGURATION ---
 # REPLACE THIS WITH YOUR ACTUAL BOT TOKEN FROM @BotFather
 BOT_TOKEN = "6214348776:AAEa4xHl0jP_pNNoA45EYi-4KyJh7rLDPf0" 
-# The username of your channel (for the 'Join Channel' button)
 CHANNEL_USERNAME = "@testchannel123494" 
+
+# NEW: Manager and Admin Settings
+MANAGER_USERNAME = "@s17aj_04" # Customer will be told to DM this person
+ADMIN_ID = 1322755444 # REPLACE WITH YOUR TELEGRAM ID (Only this ID can approve sales)
 
 # --- DATABASE SETUP ---
 DB_NAME = "referrals.db"
@@ -23,13 +26,11 @@ def init_db():
     """Initialize the SQLite database with necessary tables."""
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        # Table to track who referred whom
         c.execute('''CREATE TABLE IF NOT EXISTS referrals
                      (user_id INTEGER PRIMARY KEY, 
                       referrer_id INTEGER, 
                       join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         
-        # Table to track purchases/conversions
         c.execute('''CREATE TABLE IF NOT EXISTS purchases
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       user_id INTEGER,
@@ -54,12 +55,11 @@ def record_referral(user_id, referrer_id):
     try:
         with sqlite3.connect(DB_NAME) as conn:
             c = conn.cursor()
-            # Only record if user doesn't exist yet (first-time join)
             c.execute("INSERT INTO referrals (user_id, referrer_id) VALUES (?, ?)", (user_id, referrer_id))
             conn.commit()
             return True
     except sqlite3.IntegrityError:
-        return False # User already exists
+        return False
     except Exception as e:
         print(f"DB Error: {e}")
         return False
@@ -80,37 +80,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and handle it gracefully."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
     
-    # Deep Linking Logic: Check if the user came from a referral link
-    # Link format: t.me/YourBot?start=12345
     if args and args[0].isdigit():
         potential_referrer = int(args[0])
-        # Prevent self-referral
         if potential_referrer != user.id:
-            # Record the referral in DB
             is_new = record_referral(user.id, potential_referrer)
-            
             if is_new:
-                # Notify the referrer
                 try:
                     await context.bot.send_message(
                         chat_id=potential_referrer, 
                         text=f"🎉 New Referral! {user.first_name} just joined via your link."
                     )
                 except Exception:
-                    pass # Referrer might have blocked bot or ID is invalid
+                    pass
 
-    # UI: Welcome Message
     keyboard = [
         [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}")],
         [InlineKeyboardButton("🔗 Get My Referral Link", callback_data="get_link")],
-        [InlineKeyboardButton("🛍️ Simulate Purchase (Test)", callback_data="buy_test")]
+        [InlineKeyboardButton("🛒 Buy Premium Plan", callback_data="buy_plan")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -128,40 +120,70 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "get_link":
-        # Generate deep link using the bot's username and user's ID
         bot_username = context.bot.username
         ref_link = f"https://t.me/{bot_username}?start={user.id}"
         
+        # CHANGED TO HTML TO PREVENT UNDERSCORE ERRORS
         msg = (
-            f"Here is your unique referral link:\n\n`{ref_link}`\n\n"
+            f"Here is your unique referral link:\n\n<code>{ref_link}</code>\n\n"
             "Share this on TikTok or Instagram. When people join via this link, "
             "we will know you sent them!"
         )
-        await query.edit_message_text(text=msg, parse_mode='Markdown')
+        await query.edit_message_text(text=msg, parse_mode='HTML')
 
-    elif query.data == "buy_test":
-        # SIMULATION: This simulates a purchase happening
+    elif query.data == "buy_plan":
+        # CHANGED TO HTML TO PREVENT UNDERSCORE ERRORS
+        msg = (
+            f"🛍️ <b>How to Purchase:</b>\n\n"
+            f"Please contact our manager {MANAGER_USERNAME} to complete your payment.\n\n"
+            f"⚠️ <b>Important:</b> Please send them your User ID so they can process your order and credit your referrer.\n\n"
+            f"Your User ID is: <code>{user.id}</code>"
+        )
+        await query.edit_message_text(text=msg, parse_mode='HTML')
+
+async def approve_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_user = update.effective_user
+    
+    if admin_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        amount = float(context.args[1])
         product = "Premium Plan"
-        price = 49.99
-        
-        log_purchase(user.id, product, price)
-        referrer = get_referrer(user.id)
-        
-        text = f"✅ Purchase recorded for {product} (${price}).\n"
-        
-        if referrer:
-            text += f"\nAttribution: Referred by User ID {referrer}. They will receive credit."
-            try:
-                await context.bot.send_message(
-                    chat_id=referrer,
-                    text=f"💰 Cha-ching! Your referral {user.first_name} made a purchase of ${price}!"
-                )
-            except:
-                pass
-        else:
-            text += "\nAttribution: Organic (No referrer found)."
-            
-        await query.edit_message_text(text=text)
+    except (IndexError, ValueError):
+        # CHANGED TO HTML TO PREVENT UNDERSCORE ERRORS
+        await update.message.reply_text("❌ Usage: /approve <user_id> <amount>\nExample: <code>/approve 123456789 49.99</code>", parse_mode='HTML')
+        return
+
+    log_purchase(target_user_id, product, amount)
+    referrer_id = get_referrer(target_user_id)
+
+    response_text = f"✅ Sale approved successfully for User ID {target_user_id} (${amount}).\n"
+
+    if referrer_id:
+        response_text += f"Attribution: User was referred by {referrer_id}. They will be notified."
+        try:
+            await context.bot.send_message(
+                chat_id=referrer_id,
+                text=f"💰 Cha-ching! Your referral (User ID {target_user_id}) just made a purchase! You have earned credit for this sale."
+            )
+        except Exception:
+            pass
+    else:
+        response_text += "Attribution: Organic (No referrer found)."
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text="🎉 Your purchase has been approved by the manager! Thank you for your business."
+        )
+    except Exception:
+        pass
+
+    await update.message.reply_text(response_text)
+
 
 # --- FLASK DASHBOARD LOGIC (PRO UI) ---
 
@@ -187,11 +209,9 @@ DASHBOARD_HTML = """
         }
         body { background-color: var(--main-bg); font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         
-        /* Navbar */
         .navbar { background: var(--card-bg); box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1rem; }
         .brand-text { font-weight: 700; color: var(--primary); font-size: 1.25rem; }
         
-        /* Stats Cards */
         .stat-card {
             background: var(--card-bg);
             border: none;
@@ -215,7 +235,6 @@ DASHBOARD_HTML = """
         .stat-value { font-size: 2rem; font-weight: 700; color: #111827; }
         .stat-label { color: #6b7280; font-weight: 500; font-size: 0.9rem; }
 
-        /* Tables */
         .custom-card {
             background: var(--card-bg);
             border: none;
@@ -240,14 +259,12 @@ DASHBOARD_HTML = """
         }
         .table td { vertical-align: middle; padding: 1rem 0.75rem; }
         
-        /* Mobile Tweaks */
         @media (max-width: 768px) {
             .stat-value { font-size: 1.5rem; }
         }
     </style>
 </head>
 <body>
-    <!-- Navbar -->
     <nav class="navbar fixed-top">
         <div class="container-fluid">
             <div class="d-flex align-items-center">
@@ -262,7 +279,6 @@ DASHBOARD_HTML = """
     </nav>
 
     <div class="container" style="margin-top: 100px;">
-        <!-- Stats Row -->
         <div class="row g-4 mb-4">
             <div class="col-12 col-md-4">
                 <div class="stat-card">
@@ -287,9 +303,7 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- Tables Row -->
         <div class="row">
-            <!-- Top Referrers -->
             <div class="col-12 col-lg-6">
                 <div class="custom-card h-100">
                     <div class="card-header d-flex justify-content-between align-items-center">
@@ -313,7 +327,6 @@ DASHBOARD_HTML = """
                 </div>
             </div>
             
-            <!-- Recent Purchases -->
             <div class="col-12 col-lg-6">
                 <div class="custom-card h-100">
                     <div class="card-header d-flex justify-content-between align-items-center">
@@ -351,7 +364,6 @@ DASHBOARD_HTML = """
     </div>
 
     <script>
-        // Auto refresh
         setTimeout(function(){ location.reload(); }, 30000);
     </script>
 </body>
@@ -363,7 +375,6 @@ def dashboard():
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         
-        # Stats
         c.execute("SELECT COUNT(*) FROM referrals")
         total_refs = c.fetchone()[0]
         
@@ -374,14 +385,12 @@ def dashboard():
         sales_res = c.fetchone()[0]
         total_sales = round(sales_res, 2) if sales_res else 0.0
         
-        # Top Referrers
         c.execute('''SELECT referrer_id, COUNT(user_id) as count 
                      FROM referrals 
                      GROUP BY referrer_id 
                      ORDER BY count DESC LIMIT 10''')
         top_referrers = c.fetchall()
         
-        # Recent Purchases with Attribution
         c.execute('''SELECT p.user_id, p.product_name, p.amount, r.referrer_id 
                      FROM purchases p
                      LEFT JOIN referrals r ON p.user_id = r.user_id
@@ -401,21 +410,16 @@ def export_data():
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
-        # Create a Workbook using openpyxl (No Pandas required)
         wb = openpyxl.Workbook()
         
-        # 1. Referrals Sheet
         ws1 = wb.active
         ws1.title = "Referrals"
         cursor.execute("SELECT * FROM referrals")
-        # Write headers
         headers = [description[0] for description in cursor.description]
         ws1.append(headers)
-        # Write data
         for row in cursor.fetchall():
             ws1.append(row)
             
-        # 2. Purchases Sheet
         ws2 = wb.create_sheet(title="Purchases")
         cursor.execute("SELECT * FROM purchases")
         headers = [description[0] for description in cursor.description]
@@ -425,7 +429,6 @@ def export_data():
             
         conn.close()
         
-        # Save to memory buffer
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
@@ -440,43 +443,29 @@ def export_data():
         return f"Error creating export: {e}", 500
 
 def run_flask():
-    # Run Flask in a thread. 
-    # use_reloader=False is CRITICAL when running in a thread
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
-# --- MAIN EXECUTION ---
-
 if __name__ == '__main__':
-    # 1. Initialize DB
     init_db()
     print("Database initialized.")
 
-    # 2. Start Flask Dashboard in a separate thread
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     print("Dashboard running at http://localhost:5000")
 
-    # 3. Start Telegram Bot
     print("Starting Telegram Bot...")
     
-    # Configure custom request timeouts (critical for slow networks or regions with blocking)
     t_request = HTTPXRequest(connect_timeout=60.0, read_timeout=60.0)
-
-    # Builder pattern for python-telegram-bot v20+
     application = Application.builder().token(BOT_TOKEN).request(t_request).build()
     
-    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Add Error Handler for production robustness
+    application.add_handler(CommandHandler("approve", approve_sale))
     application.add_error_handler(error_handler)
     
-    # Run the bot
     print("Polling started. Press Ctrl+C to stop.")
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to start bot polling. Error: {e}")
-        print("Tip: If you are in a region where Telegram is blocked, you might need a VPN or Proxy.")

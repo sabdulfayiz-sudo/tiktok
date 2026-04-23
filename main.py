@@ -4,7 +4,7 @@ import sqlite3
 import threading
 import json
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes, CommandHandler, CallbackQueryHandler
@@ -42,6 +42,15 @@ def init_db():
                       username TEXT,
                       first_name TEXT,
                       join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+        # Migration: add new columns to existing databases that predate this version
+        existing_cols = {row[1] for row in c.execute("PRAGMA table_info(referrals)")}
+        if "username" not in existing_cols:
+            c.execute("ALTER TABLE referrals ADD COLUMN username TEXT")
+            print("DB Migration: added 'username' column to referrals")
+        if "first_name" not in existing_cols:
+            c.execute("ALTER TABLE referrals ADD COLUMN first_name TEXT")
+            print("DB Migration: added 'first_name' column to referrals")
 
         c.execute('''CREATE TABLE IF NOT EXISTS purchases
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +150,7 @@ def get_dashboard_stats():
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC, matches DB strings
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         week_start = now - timedelta(days=now.weekday())
 
@@ -171,7 +180,7 @@ def get_dashboard_stats():
         purchase_count = c.fetchone()["cnt"]
 
         # New referrals this month
-        c.execute("SELECT COUNT(*) as cnt FROM referrals WHERE join_date >= ?", (month_start,))
+        c.execute("SELECT COUNT(*) as cnt FROM referrals WHERE join_date >= ?", (month_start.isoformat(),))
         monthly_referrals = c.fetchone()["cnt"]
 
         # Total referrals
@@ -179,7 +188,7 @@ def get_dashboard_stats():
         total_referrals = c.fetchone()["cnt"]
 
         # Revenue this month
-        c.execute("SELECT SUM(amount) as s FROM purchases WHERE purchase_date >= ?", (month_start,))
+        c.execute("SELECT SUM(amount) as s FROM purchases WHERE purchase_date >= ?", (month_start.isoformat(),))
         monthly_revenue = c.fetchone()["s"] or 0
         monthly_revenue = round(monthly_revenue, 2)
 
@@ -218,10 +227,10 @@ def get_dashboard_stats():
             month_dt = (now.replace(day=1) - timedelta(days=i*28)).replace(day=1)
             next_month = (month_dt.replace(day=28) + timedelta(days=4)).replace(day=1)
             c.execute("SELECT COUNT(*) as cnt FROM referrals WHERE join_date >= ? AND join_date < ?",
-                      (month_dt, next_month))
+                      (month_dt.isoformat(), next_month.isoformat()))
             cnt = c.fetchone()["cnt"]
             c.execute("SELECT COALESCE(SUM(amount),0) as s FROM purchases WHERE purchase_date >= ? AND purchase_date < ?",
-                      (month_dt, next_month))
+                      (month_dt.isoformat(), next_month.isoformat()))
             rev = c.fetchone()["s"]
             monthly_data.append({
                 "month": month_dt.strftime("%b %Y"),
@@ -240,7 +249,7 @@ def get_dashboard_stats():
             GROUP BY r.referrer_id
             ORDER BY invite_count DESC
             LIMIT 1
-        ''', (week_start,))
+        ''', (week_start.isoformat(),))
         flower_week = c.fetchone()
         flower_week = dict(flower_week) if flower_week else None
 
@@ -255,7 +264,7 @@ def get_dashboard_stats():
             GROUP BY r.referrer_id
             ORDER BY invite_count DESC
             LIMIT 1
-        ''', (month_start,))
+        ''', (month_start.isoformat(),))
         flower_month = c.fetchone()
         flower_month = dict(flower_month) if flower_month else None
 
@@ -285,7 +294,7 @@ def get_dashboard_stats():
             GROUP BY r.referrer_id
             ORDER BY monthly_total DESC
             LIMIT 10
-        ''', (month_start,))
+        ''', (month_start.isoformat(),))
         monthly_payouts = [dict(row) for row in c.fetchall()]
 
         # Recent sales

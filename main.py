@@ -2,22 +2,24 @@ import os
 import logging
 import sqlite3
 import threading
-import json
-import io
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes, CommandHandler, CallbackQueryHandler
 from telegram.request import HTTPXRequest
-from flask import Flask, render_template_string, send_file, jsonify, request as flask_request
-import openpyxl
+from flask import Flask, render_template_string, jsonify, redirect
 from waitress import serve
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME")
+
+try:
+    SUCCESS_CLIENT_PRICE_DEFAULT = float(os.getenv("SUCCESS_CLIENT_PRICE", "0"))
+except ValueError:
+    SUCCESS_CLIENT_PRICE_DEFAULT = 0.0
+    print("WARNING: SUCCESS_CLIENT_PRICE in .env is not a valid number.")
 
 try:
     ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -26,6 +28,10 @@ except ValueError:
     print("WARNING: ADMIN_ID in .env is not a valid number.")
 
 DB_NAME = "referrals.db"
+
+
+def db_timestamp(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 # ─────────────────────────────────────────────
 #  DATABASE
@@ -72,6 +78,15 @@ def init_db():
                       user_id INTEGER,
                       post_type TEXT,
                       posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS settings
+                     (key TEXT PRIMARY KEY,
+                      value TEXT NOT NULL)''')
+
+        c.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            ("success_client_price", f"{SUCCESS_CLIENT_PRICE_DEFAULT:.2f}")
+        )
 
         conn.commit()
 
@@ -121,6 +136,38 @@ def record_new_user(user_id, username=None, first_name=None):
         print(f"DB Error: {e}")
 
 
+def get_success_client_price():
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key=?", ("success_client_price",))
+            row = c.fetchone()
+            return round(float(row[0]), 2) if row else round(SUCCESS_CLIENT_PRICE_DEFAULT, 2)
+    except Exception as e:
+        print(f"DB Error: {e}")
+        return round(SUCCESS_CLIENT_PRICE_DEFAULT, 2)
+
+
+def set_success_client_price(amount):
+    amount = round(float(amount), 2)
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("success_client_price", f"{amount:.2f}")
+        )
+        conn.commit()
+    return amount
+
+
+def has_purchase(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM purchases WHERE user_id=? LIMIT 1", (user_id,))
+        return c.fetchone() is not None
+
+
 def log_purchase(user_id, product, amount):
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
@@ -153,6 +200,7 @@ def get_dashboard_stats():
         now = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC, matches DB strings
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         week_start = now - timedelta(days=now.weekday())
+        success_client_price = get_success_client_price()
 
         # Total clicks
         c.execute("SELECT COUNT(*) as cnt FROM link_clicks")
@@ -161,6 +209,16 @@ def get_dashboard_stats():
         # Total buyers
         c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM purchases")
         total_buyers = c.fetchone()["cnt"]
+
+        # Referred successful clients are unique referred users with at least one approved purchase.
+        c.execute('''
+            SELECT COUNT(DISTINCT p.user_id) as cnt
+            FROM purchases p
+            JOIN referrals r ON r.user_id = p.user_id
+            WHERE r.referrer_id IS NOT NULL
+        ''')
+        referred_successful_clients = c.fetchone()["cnt"]
+        total_referral_payout = round(referred_successful_clients * success_client_price, 2)
 
         # Conversion rate
         conversion = round((total_buyers / total_clicks * 100), 1) if total_clicks > 0 else 0
@@ -180,7 +238,7 @@ def get_dashboard_stats():
         purchase_count = c.fetchone()["cnt"]
 
         # New referrals this month
-        c.execute("SELECT COUNT(*) as cnt FROM referrals WHERE join_date >= ?", (month_start.isoformat(),))
+        c.execute("SELECT COUNT(*) as cnt FROM referrals WHERE join_date >= ?", (db_timestamp(month_start),))
         monthly_referrals = c.fetchone()["cnt"]
 
         # Total referrals
@@ -188,36 +246,53 @@ def get_dashboard_stats():
         total_referrals = c.fetchone()["cnt"]
 
         # Revenue this month
-        c.execute("SELECT SUM(amount) as s FROM purchases WHERE purchase_date >= ?", (month_start.isoformat(),))
+        c.execute("SELECT SUM(amount) as s FROM purchases WHERE purchase_date >= ?", (db_timestamp(month_start),))
         monthly_revenue = c.fetchone()["s"] or 0
         monthly_revenue = round(monthly_revenue, 2)
+
+        c.execute('''
+            SELECT COUNT(*) as cnt
+            FROM (
+                SELECT p.user_id, MIN(p.purchase_date) as first_purchase
+                FROM purchases p
+                JOIN referrals r ON r.user_id = p.user_id
+                WHERE r.referrer_id IS NOT NULL
+                GROUP BY p.user_id
+                HAVING first_purchase >= ?
+            )
+        ''', (db_timestamp(month_start),))
+        monthly_successful_clients = c.fetchone()["cnt"]
+        monthly_referral_payout = round(monthly_successful_clients * success_client_price, 2)
 
         # Top referrers (all time) - who brought most clients
         c.execute('''
             SELECT r.referrer_id,
                    COUNT(r.user_id) as invite_count,
                    COALESCE(ref_info.username, CAST(r.referrer_id AS TEXT)) as display_name,
-                   COALESCE(SUM(p.amount), 0) as total_earned
+                   COUNT(DISTINCT p.user_id) as successful_clients,
+                   COUNT(p.id) as sale_count,
+                   COALESCE(SUM(p.amount), 0) as total_revenue,
+                   COUNT(DISTINCT p.user_id) * ? as total_earned
             FROM referrals r
             LEFT JOIN referrals ref_info ON ref_info.user_id = r.referrer_id
             LEFT JOIN purchases p ON p.user_id = r.user_id
             WHERE r.referrer_id IS NOT NULL
             GROUP BY r.referrer_id
-            ORDER BY invite_count DESC
+            ORDER BY successful_clients DESC, invite_count DESC
             LIMIT 10
-        ''')
+        ''', (success_client_price,))
         top_referrers = [dict(row) for row in c.fetchall()]
 
         # Average earnings per referral (for referrers who have earnings)
         c.execute('''
             SELECT AVG(earnings) as avg_earn FROM (
-                SELECT r.referrer_id, SUM(p.amount) as earnings
+                SELECT r.referrer_id, COUNT(DISTINCT p.user_id) * ? as earnings
                 FROM referrals r
                 JOIN purchases p ON p.user_id = r.user_id
                 WHERE r.referrer_id IS NOT NULL
                 GROUP BY r.referrer_id
             )
-        ''')
+        ''', (success_client_price,))
         avg_earning_per_ref = c.fetchone()["avg_earn"] or 0
         avg_earning_per_ref = round(avg_earning_per_ref, 2)
 
@@ -227,15 +302,29 @@ def get_dashboard_stats():
             month_dt = (now.replace(day=1) - timedelta(days=i*28)).replace(day=1)
             next_month = (month_dt.replace(day=28) + timedelta(days=4)).replace(day=1)
             c.execute("SELECT COUNT(*) as cnt FROM referrals WHERE join_date >= ? AND join_date < ?",
-                      (month_dt.isoformat(), next_month.isoformat()))
+                      (db_timestamp(month_dt), db_timestamp(next_month)))
             cnt = c.fetchone()["cnt"]
             c.execute("SELECT COALESCE(SUM(amount),0) as s FROM purchases WHERE purchase_date >= ? AND purchase_date < ?",
-                      (month_dt.isoformat(), next_month.isoformat()))
+                      (db_timestamp(month_dt), db_timestamp(next_month)))
             rev = c.fetchone()["s"]
+            c.execute('''
+                SELECT COUNT(*) as cnt
+                FROM (
+                    SELECT p.user_id, MIN(p.purchase_date) as first_purchase
+                    FROM purchases p
+                    JOIN referrals r ON r.user_id = p.user_id
+                    WHERE r.referrer_id IS NOT NULL
+                    GROUP BY p.user_id
+                    HAVING first_purchase >= ? AND first_purchase < ?
+                )
+            ''', (db_timestamp(month_dt), db_timestamp(next_month)))
+            successful_clients = c.fetchone()["cnt"]
             monthly_data.append({
                 "month": month_dt.strftime("%b %Y"),
                 "referrals": cnt,
-                "revenue": round(rev, 2)
+                "revenue": round(rev, 2),
+                "successful_clients": successful_clients,
+                "payout": round(successful_clients * success_client_price, 2)
             })
 
         # Top flower of the week (most referrals this week)
@@ -249,7 +338,7 @@ def get_dashboard_stats():
             GROUP BY r.referrer_id
             ORDER BY invite_count DESC
             LIMIT 1
-        ''', (week_start.isoformat(),))
+        ''', (db_timestamp(week_start),))
         flower_week = c.fetchone()
         flower_week = dict(flower_week) if flower_week else None
 
@@ -264,7 +353,7 @@ def get_dashboard_stats():
             GROUP BY r.referrer_id
             ORDER BY invite_count DESC
             LIMIT 1
-        ''', (month_start.isoformat(),))
+        ''', (db_timestamp(month_start),))
         flower_month = c.fetchone()
         flower_month = dict(flower_month) if flower_month else None
 
@@ -285,16 +374,31 @@ def get_dashboard_stats():
         c.execute('''
             SELECT r.referrer_id,
                    COALESCE(ref_info.username, CAST(r.referrer_id AS TEXT)) as display_name,
-                   SUM(p.amount) as monthly_total,
-                   COUNT(p.id) as sale_count
+                   COUNT(fp.user_id) as successful_clients,
+                   COALESCE(sales.sale_count, 0) as sale_count,
+                   COALESCE(sales.revenue, 0) as revenue,
+                   COUNT(fp.user_id) * ? as monthly_total
             FROM referrals r
-            JOIN purchases p ON p.user_id = r.user_id
+            JOIN (
+                SELECT user_id, MIN(purchase_date) as first_purchase
+                FROM purchases
+                GROUP BY user_id
+            ) fp ON fp.user_id = r.user_id
             LEFT JOIN referrals ref_info ON ref_info.user_id = r.referrer_id
-            WHERE r.referrer_id IS NOT NULL AND p.purchase_date >= ?
+            LEFT JOIN (
+                SELECT r2.referrer_id,
+                       COUNT(p2.id) as sale_count,
+                       COALESCE(SUM(p2.amount), 0) as revenue
+                FROM purchases p2
+                JOIN referrals r2 ON r2.user_id = p2.user_id
+                WHERE r2.referrer_id IS NOT NULL AND p2.purchase_date >= ?
+                GROUP BY r2.referrer_id
+            ) sales ON sales.referrer_id = r.referrer_id
+            WHERE r.referrer_id IS NOT NULL AND fp.first_purchase >= ?
             GROUP BY r.referrer_id
-            ORDER BY monthly_total DESC
+            ORDER BY successful_clients DESC, monthly_total DESC
             LIMIT 10
-        ''', (month_start.isoformat(),))
+        ''', (success_client_price, db_timestamp(month_start), db_timestamp(month_start)))
         monthly_payouts = [dict(row) for row in c.fetchall()]
 
         # Recent sales
@@ -313,13 +417,18 @@ def get_dashboard_stats():
         return {
             "total_clicks": total_clicks,
             "total_buyers": total_buyers,
+            "referred_successful_clients": referred_successful_clients,
             "conversion": conversion,
             "avg_purchase": avg_purchase,
             "total_revenue": total_revenue,
+            "success_client_price": success_client_price,
+            "total_referral_payout": total_referral_payout,
             "purchase_count": purchase_count,
             "monthly_referrals": monthly_referrals,
             "total_referrals": total_referrals,
             "monthly_revenue": monthly_revenue,
+            "monthly_successful_clients": monthly_successful_clients,
+            "monthly_referral_payout": monthly_referral_payout,
             "top_referrers": top_referrers,
             "avg_earning_per_ref": avg_earning_per_ref,
             "monthly_data": monthly_data,
@@ -329,6 +438,87 @@ def get_dashboard_stats():
             "monthly_payouts": monthly_payouts,
             "recent_sales": recent_sales,
         }
+
+
+def get_report_data():
+    stats = get_dashboard_stats()
+    success_client_price = stats["success_client_price"]
+
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+
+        c.execute('''
+            SELECT r.referrer_id,
+                   COALESCE(ref_info.username, ref_info.first_name, CAST(r.referrer_id AS TEXT)) as display_name,
+                   COUNT(DISTINCT r.user_id) as invited_clients,
+                   COUNT(DISTINCT p.user_id) as successful_clients,
+                   COUNT(p.id) as purchase_count,
+                   COALESCE(SUM(p.amount), 0) as revenue,
+                   COUNT(DISTINCT p.user_id) * ? as payout
+            FROM referrals r
+            LEFT JOIN referrals ref_info ON ref_info.user_id = r.referrer_id
+            LEFT JOIN purchases p ON p.user_id = r.user_id
+            WHERE r.referrer_id IS NOT NULL
+            GROUP BY r.referrer_id
+            ORDER BY payout DESC, successful_clients DESC, invited_clients DESC
+        ''', (success_client_price,))
+        referrers = [dict(row) for row in c.fetchall()]
+
+        c.execute('''
+            SELECT r.user_id,
+                   COALESCE(r.username, r.first_name, CAST(r.user_id AS TEXT)) as client_name,
+                   r.referrer_id,
+                   COALESCE(ref_info.username, ref_info.first_name, CAST(r.referrer_id AS TEXT)) as referrer_name,
+                   r.join_date,
+                   COUNT(p.id) as purchase_count,
+                   COALESCE(SUM(p.amount), 0) as revenue
+            FROM referrals r
+            LEFT JOIN purchases p ON p.user_id = r.user_id
+            LEFT JOIN referrals ref_info ON ref_info.user_id = r.referrer_id
+            GROUP BY r.user_id
+            ORDER BY r.join_date DESC
+            LIMIT 500
+        ''')
+        clients = [dict(row) for row in c.fetchall()]
+
+        c.execute('''
+            SELECT p.id,
+                   p.user_id,
+                   COALESCE(r.username, r.first_name, CAST(p.user_id AS TEXT)) as client_name,
+                   p.product_name,
+                   p.amount,
+                   p.purchase_date,
+                   r.referrer_id,
+                   COALESCE(ref_info.username, ref_info.first_name, CAST(r.referrer_id AS TEXT)) as referrer_name
+            FROM purchases p
+            LEFT JOIN referrals r ON r.user_id = p.user_id
+            LEFT JOIN referrals ref_info ON ref_info.user_id = r.referrer_id
+            ORDER BY p.purchase_date DESC
+            LIMIT 500
+        ''')
+        purchases = [dict(row) for row in c.fetchall()]
+
+        c.execute('''
+            SELECT lc.referrer_id,
+                   COALESCE(r.username, r.first_name, CAST(lc.referrer_id AS TEXT)) as referrer_name,
+                   COUNT(*) as click_count,
+                   MAX(lc.clicked_at) as last_click
+            FROM link_clicks lc
+            LEFT JOIN referrals r ON r.user_id = lc.referrer_id
+            GROUP BY lc.referrer_id
+            ORDER BY click_count DESC
+            LIMIT 200
+        ''')
+        link_clicks = [dict(row) for row in c.fetchall()]
+
+    return {
+        "stats": stats,
+        "referrers": referrers,
+        "clients": clients,
+        "purchases": purchases,
+        "link_clicks": link_clicks,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -346,6 +536,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
 
+def get_manager_url():
+    if not MANAGER_USERNAME:
+        return None
+    manager = MANAGER_USERNAME.strip()
+    if manager.startswith("http://") or manager.startswith("https://"):
+        return manager
+    username = manager.replace("@", "").replace("t.me/", "").strip("/")
+    return f"https://t.me/{username}" if username else None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
@@ -353,33 +553,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0].isdigit():
         potential_referrer = int(args[0])
         if potential_referrer != user.id:
-            is_new = record_referral(
+            record_referral(
                 user.id, potential_referrer,
                 username=user.username,
                 first_name=user.first_name
             )
-            if is_new:
-                try:
-                    await context.bot.send_message(
-                        chat_id=potential_referrer,
-                        text=f"🎉 New Referral! {user.first_name} just joined via your link."
-                    )
-                except Exception:
-                    pass
     else:
         record_new_user(user.id, username=user.username, first_name=user.first_name)
 
     keyboard = [
-        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}")],
-        [InlineKeyboardButton("🔗 Get My Referral Link", callback_data="get_link")],
-        [InlineKeyboardButton("🛒 Buy Premium Plan", callback_data="buy_plan")]
+        [InlineKeyboardButton("Get referral link", callback_data="get_link")]
     ]
+    manager_url = get_manager_url()
+    if manager_url:
+        keyboard.append([InlineKeyboardButton("Contact manager", url=manager_url)])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     welcome_text = (
-        f"Hello {user.first_name}! Welcome to the official bot.\n\n"
-        "We track referrals and rewards here. "
-        "Join our channel for updates or generate your own link to invite friends!"
+        f"Hello {user.first_name}.\n\n"
+        "You are recorded in the referral table. Use the button below when you need "
+        "your personal referral link. For payment or questions, write to the manager directly."
     )
 
     await update.message.reply_text(welcome_text, reply_markup=reply_markup)
@@ -399,16 +592,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             f"Here is your unique referral link:\n\n<code>{ref_link}</code>\n\n"
             "Share this on TikTok or Instagram. When people join via this link, "
-            "we will know you sent them!"
-        )
-        await query.edit_message_text(text=msg, parse_mode='HTML')
-
-    elif query.data == "buy_plan":
-        msg = (
-            f"🛍️ <b>How to Purchase:</b>\n\n"
-            f"Please contact our manager {MANAGER_USERNAME} to complete your payment.\n\n"
-            f"⚠️ <b>Important:</b> Please send them your User ID so they can process your order.\n\n"
-            f"Your User ID is: <code>{user.id}</code>"
+            "the system will add them to the table automatically."
         )
         await query.edit_message_text(text=msg, parse_mode='HTML')
 
@@ -432,32 +616,64 @@ async def approve_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    was_successful_client = has_purchase(target_user_id)
     log_purchase(target_user_id, product, amount)
     referrer_id = get_referrer(target_user_id)
+    fixed_payout = get_success_client_price()
 
-    response_text = f"✅ Sale approved for User ID {target_user_id} (${amount} — {product}).\n"
+    response_text = f"Sale approved for User ID {target_user_id} (${amount:.2f} - {product}).\n"
 
     if referrer_id:
-        response_text += f"Attribution: referred by {referrer_id}. Notifying them now."
-        try:
-            await context.bot.send_message(
-                chat_id=referrer_id,
-                text=f"💰 Cha-ching! Your referral (User ID {target_user_id}) just purchased '{product}' for ${amount}. You earned credit!"
+        if was_successful_client:
+            response_text += (
+                f"Attribution: referred by {referrer_id}. This client was already counted "
+                "as successful, so payout stays unchanged."
             )
-        except Exception:
-            pass
+        else:
+            response_text += (
+                f"Attribution: referred by {referrer_id}. Fixed payout added: "
+                f"${fixed_payout:.2f}."
+            )
     else:
         response_text += "Attribution: Organic (no referrer)."
 
-    try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text="🎉 Your purchase has been approved! Thank you for your business."
-        )
-    except Exception:
-        pass
-
     await update.message.reply_text(response_text)
+
+
+async def set_price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_user = update.effective_user
+    if admin_user.id != ADMIN_ID:
+        await update.message.reply_text("Not authorized.")
+        return
+
+    try:
+        amount = float(context.args[0])
+        if amount < 0:
+            raise ValueError
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "Usage: /setprice <amount>\n"
+            "Example: <code>/setprice 25</code>",
+            parse_mode='HTML'
+        )
+        return
+
+    amount = set_success_client_price(amount)
+    await update.message.reply_text(
+        f"Fixed payout per successful referred client is now ${amount:.2f}."
+    )
+
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_user = update.effective_user
+    if admin_user.id != ADMIN_ID:
+        await update.message.reply_text("Not authorized.")
+        return
+
+    amount = get_success_client_price()
+    await update.message.reply_text(
+        f"Current fixed payout per successful referred client: ${amount:.2f}."
+    )
 
 
 async def log_post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -624,7 +840,7 @@ DASHBOARD_HTML = r"""
   .stat-card {
     background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 14px;
+    border-radius: 8px;
     padding: 1.4rem 1.5rem;
     position: relative;
     overflow: hidden;
@@ -633,12 +849,7 @@ DASHBOARD_HTML = r"""
   .stat-card:hover { border-color: var(--accent); transform: translateY(-2px); }
 
   .stat-card::before {
-    content: '';
-    position: absolute;
-    top: -40px; right: -40px;
-    width: 100px; height: 100px;
-    border-radius: 50%;
-    opacity: .07;
+    display: none;
   }
 
   .stat-card[data-accent="purple"]::before { background: var(--accent); }
@@ -683,7 +894,7 @@ DASHBOARD_HTML = r"""
   .flower-card {
     background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 14px;
+    border-radius: 8px;
     padding: 1.5rem;
     display: flex;
     align-items: center;
@@ -728,7 +939,7 @@ DASHBOARD_HTML = r"""
   .chart-card {
     background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 14px;
+    border-radius: 8px;
     padding: 1.5rem;
   }
 
@@ -751,8 +962,8 @@ DASHBOARD_HTML = r"""
   .table-card {
     background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    overflow: hidden;
+    border-radius: 8px;
+    overflow-x: auto;
   }
 
   .table-head {
@@ -764,7 +975,7 @@ DASHBOARD_HTML = r"""
     display: flex; align-items: center; justify-content: space-between;
   }
 
-  table { width: 100%; border-collapse: collapse; }
+  table { width: 100%; border-collapse: collapse; min-width: 520px; }
   thead th {
     padding: .75rem 1.2rem;
     text-align: left;
@@ -836,6 +1047,40 @@ DASHBOARD_HTML = r"""
   .stat-card:nth-child(6)  { animation-delay: .30s }
   .stat-card:nth-child(7)  { animation-delay: .35s }
   .stat-card:nth-child(8)  { animation-delay: .40s }
+  .stat-card:nth-child(9)  { animation-delay: .45s }
+  .stat-card:nth-child(10) { animation-delay: .50s }
+
+  @media (max-width: 720px) {
+    header {
+      position: static;
+      align-items: flex-start;
+      flex-direction: column;
+      gap: .9rem;
+      padding: 1rem;
+    }
+    .header-right {
+      width: 100%;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+    .btn-export {
+      flex: 1 1 150px;
+      justify-content: center;
+    }
+    main { padding: 1rem; }
+    .section-title { margin-top: 1.6rem; }
+    .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .stat-card { padding: 1rem; }
+    .stat-value { font-size: 1.45rem; }
+    .flower-grid { grid-template-columns: 1fr; }
+    .flower-card { align-items: flex-start; padding: 1rem; }
+    .tables-grid { grid-template-columns: minmax(0, 1fr); }
+    tbody td { padding: .8rem 1rem; }
+  }
+
+  @media (max-width: 420px) {
+    .stat-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -847,9 +1092,9 @@ DASHBOARD_HTML = r"""
   </div>
   <div class="header-right">
     <span class="badge-live">● Live</span>
-    <a href="/export" class="btn-export">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      Export XLSX
+    <a href="/reports" class="btn-export">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h5"/></svg>
+      Reports
     </a>
   </div>
 </header>
@@ -865,19 +1110,19 @@ DASHBOARD_HTML = r"""
       <div class="stat-sub">All time</div>
     </div>
     <div class="stat-card" data-accent="green">
-      <div class="stat-label">Conversion Rate</div>
-      <div class="stat-value stat-accent-green">{{ stats.conversion }}%</div>
-      <div class="stat-sub">Clicks → Purchases</div>
+      <div class="stat-label">Successful Clients</div>
+      <div class="stat-value stat-accent-green">{{ stats.referred_successful_clients }}</div>
+      <div class="stat-sub">Referred buyers</div>
     </div>
     <div class="stat-card" data-accent="yellow">
-      <div class="stat-label">Avg Purchase</div>
-      <div class="stat-value stat-accent-yellow">${{ stats.avg_purchase }}</div>
-      <div class="stat-sub">Per transaction</div>
+      <div class="stat-label">Fixed Price</div>
+      <div class="stat-value stat-accent-yellow">${{ "%.2f"|format(stats.success_client_price) }}</div>
+      <div class="stat-sub">Per successful client</div>
     </div>
     <div class="stat-card" data-accent="green">
-      <div class="stat-label">Total Revenue</div>
-      <div class="stat-value stat-accent-green">${{ stats.total_revenue }}</div>
-      <div class="stat-sub">{{ stats.purchase_count }} transactions</div>
+      <div class="stat-label">Total Payout</div>
+      <div class="stat-value stat-accent-green">${{ "%.2f"|format(stats.total_referral_payout) }}</div>
+      <div class="stat-sub">Auto-calculated</div>
     </div>
     <div class="stat-card" data-accent="purple">
       <div class="stat-label">Total Referrals</div>
@@ -890,13 +1135,23 @@ DASHBOARD_HTML = r"""
       <div class="stat-sub">This month</div>
     </div>
     <div class="stat-card" data-accent="green">
-      <div class="stat-label">Monthly Revenue</div>
-      <div class="stat-value stat-accent-green">${{ stats.monthly_revenue }}</div>
-      <div class="stat-sub">This month</div>
+      <div class="stat-label">Monthly Payout</div>
+      <div class="stat-value stat-accent-green">${{ "%.2f"|format(stats.monthly_referral_payout) }}</div>
+      <div class="stat-sub">{{ stats.monthly_successful_clients }} successful clients</div>
     </div>
     <div class="stat-card" data-accent="yellow">
-      <div class="stat-label">Avg Earning / Ref</div>
-      <div class="stat-value stat-accent-yellow">${{ stats.avg_earning_per_ref }}</div>
+      <div class="stat-label">Total Revenue</div>
+      <div class="stat-value stat-accent-yellow">${{ "%.2f"|format(stats.total_revenue) }}</div>
+      <div class="stat-sub">{{ stats.purchase_count }} transactions</div>
+    </div>
+    <div class="stat-card" data-accent="red">
+      <div class="stat-label">Conversion Rate</div>
+      <div class="stat-value stat-accent-red">{{ stats.conversion }}%</div>
+      <div class="stat-sub">Clicks to purchases</div>
+    </div>
+    <div class="stat-card" data-accent="yellow">
+      <div class="stat-label">Avg Payout / Ref</div>
+      <div class="stat-value stat-accent-yellow">${{ "%.2f"|format(stats.avg_earning_per_ref) }}</div>
       <div class="stat-sub">Per referrer</div>
     </div>
   </div>
@@ -938,7 +1193,7 @@ DASHBOARD_HTML = r"""
       <canvas id="refChart" height="200"></canvas>
     </div>
     <div class="chart-card">
-      <div class="chart-title">Monthly Revenue ($)</div>
+      <div class="chart-title">Monthly Referral Payout ($)</div>
       <canvas id="revChart" height="200"></canvas>
     </div>
   </div>
@@ -953,17 +1208,18 @@ DASHBOARD_HTML = r"""
         🥇 Who Brought Most Clients
       </div>
       <table>
-        <thead><tr><th>#</th><th>User</th><th>Invites</th><th>Earned</th></tr></thead>
+        <thead><tr><th>#</th><th>User</th><th>Invites</th><th>Successful</th><th>Payout</th></tr></thead>
         <tbody>
           {% for r in stats.top_referrers %}
           <tr>
             <td><span class="rank-num {% if loop.index <= 3 %}top{% endif %}">{{ loop.index }}</span></td>
             <td>{{ r.display_name }}</td>
             <td><span class="pill pill-accent">{{ r.invite_count }}</span></td>
+            <td><span class="pill pill-green">{{ r.successful_clients }}</span></td>
             <td class="stat-accent-green">${{ "%.2f"|format(r.total_earned) }}</td>
           </tr>
           {% else %}
-          <tr class="empty-row"><td colspan="4">No referrals yet</td></tr>
+          <tr class="empty-row"><td colspan="5">No referrals yet</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -973,16 +1229,17 @@ DASHBOARD_HTML = r"""
     <div class="table-card">
       <div class="table-head">💸 Monthly Payouts by Referrer</div>
       <table>
-        <thead><tr><th>User</th><th>Sales</th><th>Total Paid</th></tr></thead>
+        <thead><tr><th>User</th><th>Successful</th><th>Payout</th><th>Revenue</th></tr></thead>
         <tbody>
           {% for p in stats.monthly_payouts %}
           <tr>
             <td>{{ p.display_name }}</td>
-            <td><span class="pill pill-muted">{{ p.sale_count }}</span></td>
+            <td><span class="pill pill-muted">{{ p.successful_clients }}</span></td>
             <td class="stat-accent-green">${{ "%.2f"|format(p.monthly_total) }}</td>
+            <td>${{ "%.2f"|format(p.revenue) }}</td>
           </tr>
           {% else %}
-          <tr class="empty-row"><td colspan="3">No sales this month</td></tr>
+          <tr class="empty-row"><td colspan="4">No sales this month</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -1043,7 +1300,7 @@ DASHBOARD_HTML = r"""
 const monthly = {{ stats.monthly_data | tojson }};
 const labels  = monthly.map(d => d.month);
 const refs    = monthly.map(d => d.referrals);
-const revs    = monthly.map(d => d.revenue);
+const revs    = monthly.map(d => d.payout);
 
 const gridColor = 'rgba(255,255,255,0.04)';
 const fontColor = '#6e7191';
@@ -1099,6 +1356,391 @@ setTimeout(() => location.reload(), 30000);
 """
 
 
+REPORTS_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ReferralBot · Reports</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0b0c10;
+    --surface: #13151c;
+    --card: #191c27;
+    --border: #252837;
+    --accent: #7c6af7;
+    --green: #43e8a4;
+    --yellow: #f5c842;
+    --red: #f76a6a;
+    --text: #e8eaf2;
+    --muted: #8589a6;
+    --font-head: 'Syne', sans-serif;
+    --font-mono: 'DM Mono', monospace;
+  }
+  body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-mono);
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 2rem;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: .8rem;
+    min-width: 0;
+  }
+  .brand-title {
+    font-family: var(--font-head);
+    font-size: 1.1rem;
+    font-weight: 800;
+  }
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: .8rem;
+    flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: .45rem;
+    min-height: 38px;
+    padding: .55rem .9rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    background: var(--card);
+    text-decoration: none;
+    font-size: .78rem;
+  }
+  .price-chip {
+    border: 1px solid rgba(67,232,164,.35);
+    border-radius: 8px;
+    padding: .55rem .8rem;
+    color: var(--green);
+    background: rgba(67,232,164,.09);
+    font-size: .78rem;
+    white-space: nowrap;
+  }
+  main {
+    width: min(1440px, 100%);
+    margin: 0 auto;
+    padding: 1.5rem 2rem 3rem;
+  }
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .summary-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card);
+    padding: 1rem;
+  }
+  .summary-label {
+    color: var(--muted);
+    font-size: .68rem;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    margin-bottom: .5rem;
+  }
+  .summary-value {
+    font-family: var(--font-head);
+    font-size: 1.6rem;
+    font-weight: 800;
+  }
+  .green { color: var(--green); }
+  .yellow { color: var(--yellow); }
+  .red { color: var(--red); }
+  .report-section {
+    margin-top: 1.25rem;
+  }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: .75rem;
+  }
+  h1, h2 {
+    font-family: var(--font-head);
+    line-height: 1.1;
+  }
+  h2 {
+    font-size: 1rem;
+  }
+  .section-meta {
+    color: var(--muted);
+    font-size: .72rem;
+  }
+  .table-wrap {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card);
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 760px;
+  }
+  th, td {
+    padding: .8rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-size: .82rem;
+  }
+  th {
+    color: var(--muted);
+    font-size: .68rem;
+    font-weight: 500;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  tr:last-child td { border-bottom: none; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 24px;
+    padding: .2rem .55rem;
+    border-radius: 999px;
+    font-size: .7rem;
+  }
+  .pill-green { background: rgba(67,232,164,.14); color: var(--green); }
+  .pill-muted { background: var(--border); color: var(--muted); }
+  .empty {
+    padding: 1.5rem;
+    color: var(--muted);
+    text-align: center;
+  }
+  @media (max-width: 900px) {
+    header {
+      position: static;
+      align-items: flex-start;
+      flex-direction: column;
+      padding: 1rem;
+    }
+    .header-actions { width: 100%; }
+    .btn, .price-chip { flex: 1 1 150px; }
+    main { padding: 1rem; }
+    .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 680px) {
+    .summary-grid { grid-template-columns: 1fr; }
+    .section-head {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: .3rem;
+    }
+    .table-wrap { overflow: visible; border: none; background: transparent; }
+    table, thead, tbody, tr, th, td { display: block; min-width: 0; width: 100%; }
+    thead { display: none; }
+    tr {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      margin-bottom: .8rem;
+      overflow: hidden;
+    }
+    td {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      border-bottom: 1px solid var(--border);
+      text-align: right;
+    }
+    td::before {
+      content: attr(data-label);
+      color: var(--muted);
+      text-align: left;
+      flex: 0 0 42%;
+    }
+    td:last-child { border-bottom: none; }
+    .empty {
+      display: block;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      text-align: center;
+    }
+    .empty::before { content: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <a class="btn" href="/">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+      Dashboard
+    </a>
+    <div class="brand-title">Reports</div>
+  </div>
+  <div class="header-actions">
+    <div class="price-chip">${{ "%.2f"|format(report.stats.success_client_price) }} per successful client</div>
+  </div>
+</header>
+
+<main>
+  <div class="summary-grid">
+    <div class="summary-card">
+      <div class="summary-label">Successful Clients</div>
+      <div class="summary-value green">{{ report.stats.referred_successful_clients }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">Total Payout</div>
+      <div class="summary-value green">${{ "%.2f"|format(report.stats.total_referral_payout) }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">Monthly Payout</div>
+      <div class="summary-value yellow">${{ "%.2f"|format(report.stats.monthly_referral_payout) }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">Total Revenue</div>
+      <div class="summary-value">${{ "%.2f"|format(report.stats.total_revenue) }}</div>
+    </div>
+  </div>
+
+  <section class="report-section">
+    <div class="section-head">
+      <h2>Payout by Referrer</h2>
+      <div class="section-meta">{{ report.referrers|length }} referrers</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Referrer</th><th>Invited</th><th>Successful</th><th>Purchases</th><th>Revenue</th><th>Payout</th></tr>
+        </thead>
+        <tbody>
+          {% for r in report.referrers %}
+          <tr>
+            <td data-label="Referrer">{{ r.display_name }}</td>
+            <td data-label="Invited"><span class="pill pill-muted">{{ r.invited_clients }}</span></td>
+            <td data-label="Successful"><span class="pill pill-green">{{ r.successful_clients }}</span></td>
+            <td data-label="Purchases">{{ r.purchase_count }}</td>
+            <td data-label="Revenue">${{ "%.2f"|format(r.revenue) }}</td>
+            <td data-label="Payout" class="green">${{ "%.2f"|format(r.payout) }}</td>
+          </tr>
+          {% else %}
+          <tr><td class="empty" colspan="6">No referral data yet</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="report-section">
+    <div class="section-head">
+      <h2>Clients</h2>
+      <div class="section-meta">Latest 500 records</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Client</th><th>User ID</th><th>Referrer</th><th>Status</th><th>Purchases</th><th>Revenue</th><th>Joined</th></tr>
+        </thead>
+        <tbody>
+          {% for c in report.clients %}
+          <tr>
+            <td data-label="Client">{{ c.client_name }}</td>
+            <td data-label="User ID">{{ c.user_id }}</td>
+            <td data-label="Referrer">{% if c.referrer_id %}{{ c.referrer_name }}{% else %}Organic{% endif %}</td>
+            <td data-label="Status">
+              {% if c.purchase_count > 0 %}
+              <span class="pill pill-green">Successful</span>
+              {% else %}
+              <span class="pill pill-muted">Lead</span>
+              {% endif %}
+            </td>
+            <td data-label="Purchases">{{ c.purchase_count }}</td>
+            <td data-label="Revenue">${{ "%.2f"|format(c.revenue) }}</td>
+            <td data-label="Joined">{{ c.join_date }}</td>
+          </tr>
+          {% else %}
+          <tr><td class="empty" colspan="7">No clients yet</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="report-section">
+    <div class="section-head">
+      <h2>Approved Purchases</h2>
+      <div class="section-meta">Latest 500 records</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Date</th><th>Client</th><th>Product</th><th>Amount</th><th>Referrer</th></tr>
+        </thead>
+        <tbody>
+          {% for p in report.purchases %}
+          <tr>
+            <td data-label="Date">{{ p.purchase_date }}</td>
+            <td data-label="Client">{{ p.client_name }}</td>
+            <td data-label="Product">{{ p.product_name }}</td>
+            <td data-label="Amount" class="green">${{ "%.2f"|format(p.amount) }}</td>
+            <td data-label="Referrer">{% if p.referrer_id %}{{ p.referrer_name }}{% else %}Organic{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td class="empty" colspan="5">No approved purchases yet</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="report-section">
+    <div class="section-head">
+      <h2>Referral Link Clicks</h2>
+      <div class="section-meta">Top 200</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Referrer</th><th>Clicks</th><th>Last Click</th></tr>
+        </thead>
+        <tbody>
+          {% for c in report.link_clicks %}
+          <tr>
+            <td data-label="Referrer">{{ c.referrer_name }}</td>
+            <td data-label="Clicks"><span class="pill pill-muted">{{ c.click_count }}</span></td>
+            <td data-label="Last Click">{{ c.last_click }}</td>
+          </tr>
+          {% else %}
+          <tr><td class="empty" colspan="3">No link clicks yet</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+</body>
+</html>
+"""
+
+
 @app.route('/')
 def dashboard():
     stats = get_dashboard_stats()
@@ -1110,47 +1752,14 @@ def api_stats():
     return jsonify(get_dashboard_stats())
 
 
+@app.route('/reports')
+def reports():
+    return render_template_string(REPORTS_HTML, report=get_report_data())
+
+
 @app.route('/export')
 def export_data():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        wb = openpyxl.Workbook()
-
-        ws1 = wb.active
-        ws1.title = "Referrals"
-        cursor.execute("SELECT * FROM referrals")
-        ws1.append([d[0] for d in cursor.description])
-        for row in cursor.fetchall(): ws1.append(list(row))
-
-        ws2 = wb.create_sheet("Purchases")
-        cursor.execute("SELECT * FROM purchases")
-        ws2.append([d[0] for d in cursor.description])
-        for row in cursor.fetchall(): ws2.append(list(row))
-
-        ws3 = wb.create_sheet("Link Clicks")
-        cursor.execute("SELECT * FROM link_clicks")
-        ws3.append([d[0] for d in cursor.description])
-        for row in cursor.fetchall(): ws3.append(list(row))
-
-        ws4 = wb.create_sheet("Content Posts")
-        cursor.execute("SELECT * FROM content_posts")
-        ws4.append([d[0] for d in cursor.description])
-        for row in cursor.fetchall(): ws4.append(list(row))
-
-        conn.close()
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f'referral_report_{datetime.now().strftime("%Y%m%d")}.xlsx'
-        )
-    except Exception as e:
-        return f"Error: {e}", 500
+    return redirect('/reports')
 
 
 def run_flask():
@@ -1180,6 +1789,8 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CommandHandler("approve", approve_sale))
+    application.add_handler(CommandHandler("setprice", set_price_cmd))
+    application.add_handler(CommandHandler("price", price_cmd))
     application.add_handler(CommandHandler("logpost", log_post_cmd))
     application.add_error_handler(error_handler)
 

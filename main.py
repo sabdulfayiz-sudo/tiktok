@@ -567,7 +567,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     manager_url = get_manager_url()
     if manager_url:
-        keyboard.append([InlineKeyboardButton("Contact manager", url=channel_url)])
+        keyboard.append([InlineKeyboardButton("Telegram Channel", url=channel_url)])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     welcome_text = (

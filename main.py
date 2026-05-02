@@ -14,6 +14,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME")
+channel_url = 'https://t.me/testchannel123494'
 
 try:
     SUCCESS_CLIENT_PRICE_DEFAULT = float(os.getenv("SUCCESS_CLIENT_PRICE", "0"))
@@ -566,7 +567,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     manager_url = get_manager_url()
     if manager_url:
-        keyboard.append([InlineKeyboardButton("Contact manager", url=manager_url)])
+        keyboard.append([InlineKeyboardButton("Contact manager", url=channel_url)])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     welcome_text = (
